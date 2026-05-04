@@ -317,7 +317,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('input', (inputs) => {
-        if (players[socket.id] && !players[socket.id].isDead) {
+        if (players[socket.id]) {
             players[socket.id].inputs = inputs;
         }
     });
@@ -328,6 +328,8 @@ io.on('connection', (socket) => {
             p.hp = p.maxHp;
             p.isDead = false;
             p.regenCooldown = 0;
+            p.inputs = { left: false, right: false, jump: false };
+            p.prevJump = false;
 
             const spawnGridX = Math.floor((Math.random() - 0.5) * 40);
             const spawnGridY = getTerrainHeight(spawnGridX);
