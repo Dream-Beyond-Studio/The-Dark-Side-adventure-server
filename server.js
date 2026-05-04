@@ -172,6 +172,11 @@ setInterval(() => {
             if (m.timer > 0) m.timer--;
 
         } else {
+            if (isNight) {
+                delete mobs[id];
+                continue;
+            }
+
             m.timer--;
             if (m.timer <= 0) {
                 m.timer = Math.floor(Math.random() * 100) + 50;
