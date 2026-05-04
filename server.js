@@ -34,15 +34,28 @@ function log(category, message) {
     const date = now.toLocaleDateString();
     if (category !== 'CMD_INPUT') console.log(`[${time}] [${category}] ${message}`);
     const fileLine = `[${date} ${time}] [${category}] ${message}\n`;
-    fs.appendFile(LOG_FILE, fileLine, (err) => { if (err) console.error("Błąd zapisu logów:", err); });
+    fs.appendFile(LOG_FILE, fileLine, (err) => { if (err) console.error(err); });
+}
+
+function takeDamage(playerId, amount) {
+    let p = players[playerId];
+    if (!p || p.isDead) return;
+    
+    p.hp -= amount;
+    io.emit('damageText', { x: p.x + p.width/2, y: p.y - 10, dmg: amount });
+    
+    if (p.hp <= 0) {
+        p.hp = 0;
+        p.isDead = true;
+        io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${p.nick} zginął.` });
+    }
 }
 
 const db = new sqlite3.Database(path.join(__dirname, 'game.db'), (err) => {
     if (err) {
-        log('BŁĄD', `Błąd połączenia z bazą SQLite: ${err.message}`);
+        log('BŁĄD', err.message);
     } else {
-        log('SYSTEM', 'Połączono z bazą danych SQLite.');
-        
+        log('SYSTEM', 'DB OK');
         db.run(`CREATE TABLE IF NOT EXISTS players (
             nick TEXT PRIMARY KEY,
             x REAL,
@@ -63,24 +76,21 @@ rl.on('line', (input) => {
             const text = args.join(' ');
             if (text) {
                 io.emit('chatMessage', { id: 'SERVER', nick: '[CONSOLE]', text: text });
-                log('CMD', `Konsola: ${text}`);
+                log('CMD', text);
             }
             break;
         case 'list':
-            console.log("--- LISTA GRACZY ---");
             Object.keys(players).forEach(id => {
-                console.log(`ID: ${id} | Nick: ${players[id].nick} | Poz: [${Math.floor(players[id].x/32)}, ${Math.floor(players[id].y/32)}]`);
+                console.log(`${id} | ${players[id].nick} | ${Math.floor(players[id].x/32)} ${Math.floor(players[id].y/32)}`);
             });
             break;
         case 'kick':
             if (players[args[0]]) {
                 io.sockets.sockets.get(args[0])?.disconnect(true);
-                log('CMD', `Wyrzucono gracza: ${args[0]}`);
             }
             break;
         case 'stop':
-            io.emit('chatMessage', { id: 'SERVER', nick: '[SERWER]', text: 'Zamykanie serwera. Trwa zapisywanie...' });
-            
+            io.emit('chatMessage', { id: 'SERVER', nick: '[SERWER]', text: 'STOP' });
             db.serialize(() => {
                 db.run("BEGIN TRANSACTION");
                 for (let id in players) {
@@ -90,13 +100,10 @@ rl.on('line', (input) => {
                     }
                 }
                 db.run("COMMIT", () => {
-                    log('SYSTEM', 'Stan graczy zapisany. Wyłączanie.');
                     process.exit(0);
                 });
             });
             break;
-        default:
-            console.log("Komendy: say <txt>, list, kick <id>, stop");
     }
 });
 
@@ -169,26 +176,20 @@ function generateChunk(chunkX) {
             const cave = isCave(worldX, y);
             
             if (y < surfaceY) {
-                if (y >= SEA_LEVEL) chunkData[y][x] = 12; 
-                else chunkData[y][x] = 0; 
+                if (y >= SEA_LEVEL) chunkData[y][x] = 12; else chunkData[y][x] = 0; 
             } 
             else if (y === surfaceY) {
                  if (y >= SEA_LEVEL) chunkData[y][x] = 2; 
                  else {
-                     if (cave) {
-                         chunkData[y][x] = 0; 
-                     } else {
+                     if (cave) { chunkData[y][x] = 0; } 
+                     else {
                          chunkData[y][x] = 1; 
-                         if (x >= 3 && x <= CHUNK_SIZE - 4 && pseudoRandom(worldX, surfaceY) < 0.08) {
-                             createTree(chunkData, x, surfaceY, worldX);
-                         }
                      }
                  }
             } 
             else {
                 if (cave) {
-                    if (y > 105) chunkData[y][x] = 12; 
-                    else chunkData[y][x] = 0;
+                    if (y > 105) chunkData[y][x] = 12; else chunkData[y][x] = 0;
                 }
                 else {
                     chunkData[y][x] = (y < surfaceY + 8) ? 2 : 5; 
@@ -197,9 +198,17 @@ function generateChunk(chunkX) {
         }
     }
 
-    for (let y = 0; y < MAP_HEIGHT; y++) {
-        for (let x = 0; x < CHUNK_SIZE; x++) {
-            const worldX = chunkX * CHUNK_SIZE + x;
+    for (let x = 0; x < CHUNK_SIZE; x++) {
+        const worldX = chunkX * CHUNK_SIZE + x;
+        const surfaceY = getTerrainHeight(worldX);
+
+        if (chunkData[surfaceY] && chunkData[surfaceY][x] === 1) {
+            if (x >= 3 && x <= CHUNK_SIZE - 4 && pseudoRandom(worldX, surfaceY) < 0.08) {
+                createTree(chunkData, x, surfaceY, worldX);
+            }
+        }
+
+        for (let y = 0; y < MAP_HEIGHT; y++) {
             if (chunkData[y][x] === 5) {
                 const rand = pseudoRandom(worldX, y);
                 if (rand < 0.05) { 
@@ -224,7 +233,6 @@ function getTile(gridX, gridY) {
     if (worldChanges[key] !== undefined) return worldChanges[key];
     const chunkX = Math.floor(gridX / CHUNK_SIZE);
     const localX = ((gridX % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
-    
     if (!chunks[chunkX]) { chunkQueue.add(chunkX); return 99; }
     return chunks[chunkX][gridY][localX];
 }
@@ -240,8 +248,20 @@ function applyPhysics(entity) {
     const feetY = Math.floor((entity.y + entity.height - 2) / TILE_SIZE);
     entity.inWater = (getTile(gridX, centerY) === 12) || (getTile(gridX, feetY) === 12);
 
-    if (entity.inWater) { entity.velY += GRAVITY * 0.4; if (entity.velY > 4) entity.velY = 4; } 
-    else { entity.velY += GRAVITY; if (entity.velY > 12) entity.velY = 12; }
+    if (entity.inWater) { 
+        entity.velY += GRAVITY * 0.4; 
+        if (entity.velY > 4) entity.velY = 4; 
+        entity.highestY = undefined;
+    } else { 
+        entity.velY += GRAVITY; 
+        if (entity.velY > 12) entity.velY = 12; 
+    }
+
+    if (!entity.grounded && entity.velY > 0 && !entity.inWater) {
+        if (entity.highestY === undefined) entity.highestY = entity.y;
+    } else if (entity.velY < 0) {
+        entity.highestY = undefined;
+    }
 
     entity.y += entity.velY;
     entity.grounded = false;
@@ -250,7 +270,18 @@ function applyPhysics(entity) {
     for (let px of pointsX) {
         if (entity.velY > 0 && isSolid(px, entity.y + entity.height)) {
             entity.y = Math.floor((entity.y + entity.height) / TILE_SIZE) * TILE_SIZE - entity.height;
-            entity.velY = 0; entity.grounded = true; break;
+            entity.grounded = true; 
+            
+            if (entity.isPlayer && entity.highestY !== undefined && !entity.isDead) {
+                const fallDist = (entity.y - entity.highestY) / TILE_SIZE;
+                if (fallDist > 6) {
+                    const dmg = Math.floor((fallDist - 6) * 10);
+                    if (dmg > 0) takeDamage(entity.id, dmg);
+                }
+            }
+            entity.highestY = undefined;
+            entity.velY = 0; 
+            break;
         } else if (entity.velY < 0 && isSolid(px, entity.y)) {
             entity.y = (Math.floor(entity.y / TILE_SIZE) + 1) * TILE_SIZE;
             entity.velY = 0; break;
@@ -285,16 +316,13 @@ setInterval(() => {
             db.run("BEGIN TRANSACTION");
             for (let id in players) {
                 const p = players[id];
-                if (p.nick && p.nick !== "Gracz") {
-                    db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", [p.nick, p.x, p.y]);
-                }
+                if (p.nick && p.nick !== "Gracz") db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", [p.nick, p.x, p.y]);
             }
             db.run("COMMIT");
         });
     }
 
     const playerIds = Object.keys(players);
-
     if (playerIds.length > 0 && Object.keys(mobs).length < 4) {
         if (Math.random() < 0.005) {
             const p = players[playerIds[Math.floor(Math.random() * playerIds.length)]];
@@ -324,21 +352,38 @@ setInterval(() => {
         let p = players[id];
         const speed = p.inWater ? 2.5 : 5;
         p.velX = 0;
-        if (p.inputs.left) p.velX = -speed;
-        if (p.inputs.right) p.velX = speed;
+        
+        if (!p.isDead) {
+            if (p.inputs.left) p.velX = -speed;
+            if (p.inputs.right) p.velX = speed;
 
-        if (p.inputs.jump) {
-            if (p.inWater) p.velY = -4; 
-            else if (p.grounded) { p.velY = -11; p.grounded = false; }
+            if (p.inputs.jump) {
+                if (p.grounded) { 
+                    p.velY = -11; 
+                    p.grounded = false; 
+                } 
+                else if (p.inWater) {
+                    if (!p.prevJump) {
+                        p.velY = -6.5; 
+                    } 
+                    else if (p.velY > -2.5) {
+                        p.velY -= 0.5;
+                    }
+                }
+            }
         }
+        p.prevJump = p.inputs.jump;
+
         applyPhysics(p);
 
         const pChunkX = Math.floor(p.x / (CHUNK_SIZE * TILE_SIZE));
         for (let i = -2; i <= 2; i++) if (!chunks[pChunkX + i]) chunkQueue.add(pChunkX + i);
     }
-
-    io.emit('gameState', { players, mobs, time: gameTime });
 }, 1000 / 60);
+
+setInterval(() => {
+    io.emit('gameState', { players, mobs, time: gameTime });
+}, 1000 / 20);
 
 function handleCommand(socket, msg) {
     const parts = msg.slice(1).split(' ');
@@ -350,33 +395,38 @@ function handleCommand(socket, msg) {
             const newNick = args.join(' ').substring(0, 15);
             if (newNick && players[socket.id]) {
                 const oldNick = players[socket.id].nick;
-
-                if (oldNick !== "Gracz") {
-                    db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", [oldNick, players[socket.id].x, players[socket.id].y]);
-                }
-
+                if (oldNick !== "Gracz") db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", [oldNick, players[socket.id].x, players[socket.id].y]);
                 players[socket.id].nick = newNick;
                 io.emit('playerNickUpdate', { id: socket.id, nick: newNick });
-                socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `Zmieniłeś nick na: ${newNick}` });
+                socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `OK` });
             }
             break;
         case 'tp':
             if (args.length >= 2 && players[socket.id]) {
                 players[socket.id].x = parseInt(args[0]) * TILE_SIZE;
                 players[socket.id].y = parseInt(args[1]) * TILE_SIZE;
-                socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `Teleportowano do ${args[0]}, ${args[1]}` });
+                socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `TP` });
             }
             break;
-        default:
-            socket.emit('chatMessage', { id: 'SYSTEM', nick: 'BŁĄD', text: 'Nieznana komenda.' });
     }
 }
 
 io.on('connection', (socket) => {
+    const spawnGridX = Math.floor((Math.random() - 0.5) * 40);
+    const spawnGridY = getTerrainHeight(spawnGridX);
+    const spawnX = spawnGridX * TILE_SIZE;
+    const spawnY = spawnGridY * TILE_SIZE - 40; 
+
     players[socket.id] = { 
-        x: 0, y: -200, width: 20, height: 40, velX: 0, velY: 0, grounded: false, inWater: false, 
+        id: socket.id,
+        isPlayer: true,
+        isDead: false,
+        hp: 100,
+        maxHp: 100,
+        x: spawnX, y: spawnY, width: 20, height: 40, velX: 0, velY: 0, grounded: false, inWater: false, 
         nick: "Gracz", color: '#' + Math.floor(Math.random()*16777215).toString(16),
-        inputs: { left: false, right: false, jump: false }
+        inputs: { left: false, right: false, jump: false },
+        prevJump: false
     };
 
     socket.emit('initWorld', { chunks, worldChanges, dayDuration: DAY_DURATION });
@@ -385,18 +435,13 @@ io.on('connection', (socket) => {
         if (players[socket.id]) {
             const cleanNick = nick.substring(0, 15);
             players[socket.id].nick = cleanNick; 
-
+            
             db.get("SELECT x, y FROM players WHERE nick = ?", [cleanNick], (err, row) => {
-                if (err) {
-                    console.error("Błąd zapytania DB:", err);
-                    return;
-                }
+                if (err) return;
                 if (row) {
                     players[socket.id].x = row.x;
                     players[socket.id].y = row.y;
-                    socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `Witaj ponownie, ${cleanNick}! Wczytano Twoją pozycję.` });
-                } else {
-                    io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${cleanNick} dołączył do gry!` });
+                    socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `OK` });
                 }
             });
         }
@@ -405,41 +450,62 @@ io.on('connection', (socket) => {
     socket.on('chatMessage', (msg) => {
         if (!msg) return;
         const cleanMsg = msg.trim().substring(0, 100);
-        if (cleanMsg.startsWith('/')) {
-            handleCommand(socket, cleanMsg);
-        } else {
+        if (cleanMsg.startsWith('/')) handleCommand(socket, cleanMsg);
+        else {
             const nick = players[socket.id] ? players[socket.id].nick : "Gracz";
             io.emit('chatMessage', { id: socket.id, nick: nick, text: cleanMsg });
         }
     });
 
     socket.on('input', (inputs) => {
-        if (players[socket.id]) players[socket.id].inputs = inputs;
+        if (players[socket.id] && !players[socket.id].isDead) {
+            players[socket.id].inputs = inputs;
+        }
+    });
+
+    socket.on('respawn', () => {
+        let p = players[socket.id];
+        if (p && p.isDead) {
+            p.hp = p.maxHp;
+            p.isDead = false;
+            
+            const spawnGridX = Math.floor((Math.random() - 0.5) * 40);
+            const spawnGridY = getTerrainHeight(spawnGridX);
+            p.x = spawnGridX * TILE_SIZE;
+            p.y = spawnGridY * TILE_SIZE - 40;
+            p.velY = 0;
+            p.velX = 0;
+            p.highestY = undefined;
+        }
     });
 
     socket.on('shoot', (target) => {
         const shooter = players[socket.id];
-        if (!shooter) return;
+        if (!shooter || shooter.isDead) return;
         
-        socket.broadcast.emit('playerShoot', { 
-            x1: shooter.x + shooter.width/2, 
-            y1: shooter.y + shooter.height/2, 
-            x2: target.x, y2: target.y 
-        });
-
+        socket.broadcast.emit('playerShoot', { x1: shooter.x + shooter.width/2, y1: shooter.y + shooter.height/2, x2: target.x, y2: target.y });
+        
         for (let id in mobs) {
             let m = mobs[id];
-            if (target.x >= m.x && target.x <= m.x + m.width &&
-                target.y >= m.y && target.y <= m.y + m.height) {
-                
-                log('KILL', `${shooter.nick} zabił krowę ID ${id}`);
+            if (target.x >= m.x && target.x <= m.x + m.width && target.y >= m.y && target.y <= m.y + m.height) {
                 delete mobs[id];
+                break; 
+            }
+        }
+
+        for (let id in players) {
+            if (id === socket.id) continue; 
+            let p = players[id];
+            if (target.x >= p.x && target.x <= p.x + p.width && target.y >= p.y && target.y <= p.y + p.height && !p.isDead) {
+                takeDamage(id, 25); 
                 break; 
             }
         }
     });
 
     socket.on('blockUpdate', (data) => {
+        if (players[socket.id] && players[socket.id].isDead) return;
+
         const { x, y, type } = data;
         const currentTile = getTile(x, y);
         if (currentTile === 99) return; 
@@ -457,15 +523,13 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => { 
         if(players[socket.id]) {
             const p = players[socket.id];
-            
-            if (p.nick && p.nick !== "Gracz") {
+            if (p.nick && p.nick !== "Gracz" && !p.isDead) {
                 db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", [p.nick, p.x, p.y]);
             }
-
-            io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${p.nick} wyszedł z gry.` });
+            io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `DC` });
             delete players[socket.id]; 
         }
     });
 });
 
-http.listen(3000, () => console.log('SERWER: Gotowy! (Baza danych SQLite aktywna)'));
+http.listen(3000, () => console.log('OK'));

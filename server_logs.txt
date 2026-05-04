@@ -1,0 +1,7 @@
+[4.05.2026 19:22:06] [SYSTEM] Połączono z bazą danych SQLite.
+[4.05.2026 19:26:53] [SYS] DB OK
+[4.05.2026 19:32:35] [SYS] DB OK
+[4.05.2026 19:32:48] [CMD] tt
+[4.05.2026 19:36:11] [SYSTEM] Połączono z bazą danych SQLite.
+[4.05.2026 19:49:32] [SYSTEM] DB OK
+[4.05.2026 19:56:17] [SYSTEM] DB OK
