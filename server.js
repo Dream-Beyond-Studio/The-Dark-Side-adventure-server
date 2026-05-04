@@ -3,66 +3,37 @@ const app = express();
 const http = require('http').createServer(app);
 const io = require('socket.io')(http, { cors: { origin: "*" } });
 const path = require('path');
-const fs = require('fs');
 const readline = require('readline');
-const sqlite3 = require('sqlite3').verbose();
+
+const { TILE_SIZE, CHUNK_SIZE, DAY_DURATION, MOBS_CONFIG } = require('./serverConfig');
+const { log, savePlayer, loadPlayer, saveAllPlayers } = require('./database');
+const { generateChunkData, getTerrainHeight } = require('./worldGenerator');
+const { applyPhysics, getTile } = require('./physics');
 
 app.use(express.static(path.join(__dirname, 'public')));
-
-const TILE_SIZE = 32;
-const CHUNK_SIZE = 16;
-const MAP_HEIGHT = 128;
-const SEA_LEVEL = 60; 
-const GRAVITY = 0.5;
-const DAY_DURATION = 14400; 
-
-const MOBS_CONFIG = { cow: { width: 40, height: 28, speed: 1.2, jumpForce: -8 } };
 
 let players = {};
 let mobs = {};
 let mobIdCounter = 0;
-let chunks = {}; 
-let worldChanges = {}; 
+let chunks = {};
+let worldChanges = {};
 let gameTime = 0;
-let chunkQueue = new Set(); 
-
-const LOG_FILE = path.join(__dirname, 'server_logs.txt');
-
-function log(category, message) {
-    const now = new Date();
-    const time = now.toLocaleTimeString();
-    const date = now.toLocaleDateString();
-    if (category !== 'CMD_INPUT') console.log(`[${time}] [${category}] ${message}`);
-    const fileLine = `[${date} ${time}] [${category}] ${message}\n`;
-    fs.appendFile(LOG_FILE, fileLine, (err) => { if (err) console.error(err); });
-}
+let chunkQueue = new Set();
 
 function takeDamage(playerId, amount) {
     let p = players[playerId];
     if (!p || p.isDead) return;
-    
+
     p.hp -= amount;
+    p.regenCooldown = 300;
     io.emit('damageText', { x: p.x + p.width/2, y: p.y - 10, dmg: amount });
-    
+
     if (p.hp <= 0) {
         p.hp = 0;
         p.isDead = true;
         io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${p.nick} zginął.` });
     }
 }
-
-const db = new sqlite3.Database(path.join(__dirname, 'game.db'), (err) => {
-    if (err) {
-        log('BŁĄD', err.message);
-    } else {
-        log('SYSTEM', 'DB OK');
-        db.run(`CREATE TABLE IF NOT EXISTS players (
-            nick TEXT PRIMARY KEY,
-            x REAL,
-            y REAL
-        )`);
-    }
-});
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 rl.on('line', (input) => {
@@ -90,282 +61,161 @@ rl.on('line', (input) => {
             }
             break;
         case 'stop':
-            io.emit('chatMessage', { id: 'SERVER', nick: '[SERWER]', text: 'STOP' });
-            db.serialize(() => {
-                db.run("BEGIN TRANSACTION");
-                for (let id in players) {
-                    if (players[id].nick && players[id].nick !== "Gracz") {
-                        db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", 
-                        [players[id].nick, players[id].x, players[id].y]);
-                    }
-                }
-                db.run("COMMIT", () => {
-                    process.exit(0);
-                });
+            io.emit('chatMessage', { id: 'SERVER', nick: '[SERWER]', text: 'Zamykanie serwera...' });
+            saveAllPlayers(players, () => {
+                log('SYSTEM', 'STOP');
+                process.exit(0);
             });
             break;
     }
 });
 
-function pseudoRandom(x, y) {
-    let n = x * 331 + y * 439; n = Math.sin(n) * 12345.6789;
-    return n - Math.floor(n);
-}
-
-function getTerrainHeight(worldX) {
-    let h = 30 + Math.sin(worldX * 0.1) * 8 + Math.sin(worldX * 0.05) * 12 + 5;
-    const oceanNoise = Math.sin(worldX * 0.02);
-    if (oceanNoise > 0.4) h += (oceanNoise - 0.4) * 50; 
-    return Math.floor(h);
-}
-
-function isCave(x, y) {
-    const val = Math.sin(x / 15) * Math.cos(y / 15) + Math.sin((x + y) / 30) * 0.5;
-    const depthFactor = Math.min(1, Math.max(0, (y - 30) / 70));
-    const threshold = 0.65 - (depthFactor * 0.25);
-    return val > threshold;
-}
-
-function createTree(chunkData, localX, groundY, worldX) {
-    const hRand = pseudoRandom(worldX, groundY); 
-    const treeHeight = Math.floor(hRand * 3) + 4; 
-    
-    for (let i = 1; i <= treeHeight; i++) {
-        const trunkY = groundY - i;
-        if (trunkY >= 0 && trunkY < MAP_HEIGHT) chunkData[trunkY][localX] = 3; 
-    }
-    
-    const topY = groundY - treeHeight;
-    for (let ly = topY - 2; ly <= topY + 1; ly++) {
-        for (let lx = localX - 2; lx <= localX + 2; lx++) {
-            const dx = Math.abs(lx - localX);
-            const dy = ly - topY; 
-            if (dx === 2 && dy === -2) continue; 
-            if (dx === 2 && dy === 1) continue;  
-            if (lx >= 0 && lx < CHUNK_SIZE && ly >= 0 && ly < MAP_HEIGHT) {
-                if (chunkData[ly][lx] !== 3) chunkData[ly][lx] = 4; 
-            }
-        }
-    }
-}
-
-function spawnVein(chunkData, centerX, centerY, oreID, worldX) {
-    const positions = [{x:0,y:0}, {x:1,y:0}, {x:-1,y:0}, {x:0,y:1}, {x:0,y:-1}];
-    for (let pos of positions) {
-        if (pseudoRandom(worldX + pos.x, centerY + pos.y) > 0.3) {
-            const tx = centerX + pos.x;
-            const ty = centerY + pos.y;
-            if (tx >= 0 && tx < CHUNK_SIZE && ty >= 0 && ty < MAP_HEIGHT) {
-                if (chunkData[ty][tx] === 5) chunkData[ty][tx] = oreID;
-            }
-        }
-    }
-}
-
-function generateChunk(chunkX) {
-    const chunkData = [];
-    for (let y = 0; y < MAP_HEIGHT; y++) chunkData[y] = new Array(CHUNK_SIZE).fill(0);
-
-    for (let x = 0; x < CHUNK_SIZE; x++) {
-        const worldX = chunkX * CHUNK_SIZE + x;
-        const surfaceY = getTerrainHeight(worldX);
-
-        for (let y = 0; y < MAP_HEIGHT; y++) {
-            if (y >= MAP_HEIGHT - 3) { chunkData[y][x] = 99; continue; } 
-            
-            const cave = isCave(worldX, y);
-            
-            if (y < surfaceY) {
-                if (y >= SEA_LEVEL) chunkData[y][x] = 12; else chunkData[y][x] = 0; 
-            } 
-            else if (y === surfaceY) {
-                 if (y >= SEA_LEVEL) chunkData[y][x] = 2; 
-                 else {
-                     if (cave) { chunkData[y][x] = 0; } 
-                     else {
-                         chunkData[y][x] = 1; 
-                     }
-                 }
-            } 
-            else {
-                if (cave) {
-                    if (y > 105) chunkData[y][x] = 12; else chunkData[y][x] = 0;
-                }
-                else {
-                    chunkData[y][x] = (y < surfaceY + 8) ? 2 : 5; 
-                }
-            }
-        }
-    }
-
-    for (let x = 0; x < CHUNK_SIZE; x++) {
-        const worldX = chunkX * CHUNK_SIZE + x;
-        const surfaceY = getTerrainHeight(worldX);
-
-        if (chunkData[surfaceY] && chunkData[surfaceY][x] === 1) {
-            if (x >= 3 && x <= CHUNK_SIZE - 4 && pseudoRandom(worldX, surfaceY) < 0.08) {
-                createTree(chunkData, x, surfaceY, worldX);
-            }
-        }
-
-        for (let y = 0; y < MAP_HEIGHT; y++) {
-            if (chunkData[y][x] === 5) {
-                const rand = pseudoRandom(worldX, y);
-                if (rand < 0.05) { 
-                    let oreID = 6; 
-                    if (y > 60 && rand < 0.004) oreID = 9; 
-                    else if (y > 50 && rand < 0.01) oreID = 8; 
-                    else if (y > 40 && rand < 0.02) oreID = 7; 
-                    spawnVein(chunkData, x, y, oreID, worldX);
-                }
-            }
-        }
-    }
-
-    chunks[chunkX] = chunkData;
-    io.emit('newChunk', { chunkX, data: chunkData });
-}
-
-function getTile(gridX, gridY) {
-    if (gridY >= MAP_HEIGHT) return 99;
-    if (gridY < 0) return 0;
-    const key = `${gridX},${gridY}`;
-    if (worldChanges[key] !== undefined) return worldChanges[key];
-    const chunkX = Math.floor(gridX / CHUNK_SIZE);
-    const localX = ((gridX % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
-    if (!chunks[chunkX]) { chunkQueue.add(chunkX); return 99; }
-    return chunks[chunkX][gridY][localX];
-}
-
-function isSolid(x, y) {
-    const tile = getTile(Math.floor(x / TILE_SIZE), Math.floor(y / TILE_SIZE));
-    return !(tile === 0 || tile === 3 || tile === 4 || tile === 12);
-}
-
-function applyPhysics(entity) {
-    const gridX = Math.floor((entity.x + entity.width/2) / TILE_SIZE);
-    const centerY = Math.floor((entity.y + entity.height/2) / TILE_SIZE);
-    const feetY = Math.floor((entity.y + entity.height - 2) / TILE_SIZE);
-    entity.inWater = (getTile(gridX, centerY) === 12) || (getTile(gridX, feetY) === 12);
-
-    if (entity.inWater) { 
-        entity.velY += GRAVITY * 0.4; 
-        if (entity.velY > 4) entity.velY = 4; 
-        entity.highestY = undefined;
-    } else { 
-        entity.velY += GRAVITY; 
-        if (entity.velY > 12) entity.velY = 12; 
-    }
-
-    if (!entity.grounded && entity.velY > 0 && !entity.inWater) {
-        if (entity.highestY === undefined) entity.highestY = entity.y;
-    } else if (entity.velY < 0) {
-        entity.highestY = undefined;
-    }
-
-    entity.y += entity.velY;
-    entity.grounded = false;
-
-    const pointsX = [entity.x + 2, entity.x + entity.width - 2];
-    for (let px of pointsX) {
-        if (entity.velY > 0 && isSolid(px, entity.y + entity.height)) {
-            entity.y = Math.floor((entity.y + entity.height) / TILE_SIZE) * TILE_SIZE - entity.height;
-            entity.grounded = true; 
-            
-            if (entity.isPlayer && entity.highestY !== undefined && !entity.isDead) {
-                const fallDist = (entity.y - entity.highestY) / TILE_SIZE;
-                if (fallDist > 6) {
-                    const dmg = Math.floor((fallDist - 6) * 10);
-                    if (dmg > 0) takeDamage(entity.id, dmg);
-                }
-            }
-            entity.highestY = undefined;
-            entity.velY = 0; 
-            break;
-        } else if (entity.velY < 0 && isSolid(px, entity.y)) {
-            entity.y = (Math.floor(entity.y / TILE_SIZE) + 1) * TILE_SIZE;
-            entity.velY = 0; break;
-        }
-    }
-
-    entity.x += entity.velX;
-    const pointsY = [entity.y + 2, entity.y + entity.height / 2, entity.y + entity.height - 2];
-    for (let py of pointsY) {
-        if (entity.velX > 0 && isSolid(entity.x + entity.width, py)) {
-            entity.x = Math.floor((entity.x + entity.width) / TILE_SIZE) * TILE_SIZE - entity.width;
-            entity.velX = 0; break;
-        } else if (entity.velX < 0 && isSolid(entity.x, py)) {
-            entity.x = (Math.floor(entity.x / TILE_SIZE) + 1) * TILE_SIZE;
-            entity.velX = 0; break;
-        }
-    }
-}
-
 setInterval(() => {
     if (chunkQueue.size > 0) {
-        const chunkToGen = chunkQueue.values().next().value; 
-        if (!chunks[chunkToGen]) generateChunk(chunkToGen);
+        const chunkToGen = chunkQueue.values().next().value;
+        if (!chunks[chunkToGen]) {
+            const chunkData = generateChunkData(chunkToGen);
+            chunks[chunkToGen] = chunkData;
+            io.emit('newChunk', { chunkX: chunkToGen, data: chunkData });
+        }
         chunkQueue.delete(chunkToGen);
     }
 
     gameTime++;
     if (gameTime >= DAY_DURATION) gameTime = 0;
 
+    const progress = gameTime / DAY_DURATION;
+    const isNight = progress > 0.8 || progress < 0.2;
+
     if (gameTime % 600 === 0) {
-        db.serialize(() => {
-            db.run("BEGIN TRANSACTION");
-            for (let id in players) {
-                const p = players[id];
-                if (p.nick && p.nick !== "Gracz") db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", [p.nick, p.x, p.y]);
-            }
-            db.run("COMMIT");
-        });
+        saveAllPlayers(players);
     }
 
     const playerIds = Object.keys(players);
-    if (playerIds.length > 0 && Object.keys(mobs).length < 4) {
-        if (Math.random() < 0.005) {
+    if (playerIds.length > 0 && Object.keys(mobs).length < 12) {
+        if (Math.random() < 0.015) {
             const p = players[playerIds[Math.floor(Math.random() * playerIds.length)]];
             const id = mobIdCounter++;
-            mobs[id] = { id: id, type: 'cow', x: p.x + (Math.random() - 0.5) * 600, y: p.y - 100, width: 40, height: 28, velX: 0, velY: 0, grounded: false, inWater: false, facingRight: true, timer: 0 };
+            const type = isNight ? 'zombie' : 'cow';
+            
+            const spawnX = p.x + (Math.random() - 0.5) * 800;
+            const gridX = Math.floor(spawnX / TILE_SIZE);
+            const gridY = getTerrainHeight(gridX);
+            const spawnY = gridY * TILE_SIZE - MOBS_CONFIG[type].height;
+            
+            mobs[id] = { 
+                id: id, 
+                type: type, 
+                x: spawnX, 
+                y: spawnY, 
+                width: MOBS_CONFIG[type].width, 
+                height: MOBS_CONFIG[type].height, 
+                velX: 0, 
+                velY: 0, 
+                grounded: false, 
+                inWater: false, 
+                facingRight: true, 
+                timer: 0,
+                hp: MOBS_CONFIG[type].maxHp,
+                maxHp: MOBS_CONFIG[type].maxHp
+            };
         }
     }
 
     for (let id in mobs) {
         let m = mobs[id];
-        const speed = m.inWater ? MOBS_CONFIG.cow.speed * 0.5 : MOBS_CONFIG.cow.speed;
-        m.timer--;
-        if (m.timer <= 0) {
-            m.timer = Math.floor(Math.random() * 100) + 50;
-            const r = Math.random();
-            if (r < 0.3) m.velX = 0; else if (r < 0.6) { m.velX = speed; m.facingRight = true; } else { m.velX = -speed; m.facingRight = false; }
+        const config = MOBS_CONFIG[m.type];
+        const speed = m.inWater ? config.speed * 0.5 : config.speed;
+
+        if (m.type === 'zombie') {
+            if (!isNight) {
+                if (gameTime % 30 === 0) {
+                    m.hp -= 10;
+                    io.emit('damageText', { x: m.x + m.width/2, y: m.y - 10, dmg: 10 });
+                }
+                if (m.hp <= 0) {
+                    delete mobs[id];
+                    continue;
+                }
+            }
+
+            let closestPlayer = null;
+            let minDistance = 400;
+
+            for (let pid in players) {
+                let p = players[pid];
+                if (p.isDead) continue;
+                let dist = Math.hypot(p.x - m.x, p.y - m.y);
+                if (dist < minDistance) {
+                    minDistance = dist;
+                    closestPlayer = p;
+                }
+            }
+
+            if (closestPlayer) {
+                if (closestPlayer.x < m.x) {
+                    m.velX = -speed;
+                    m.facingRight = false;
+                } else {
+                    m.velX = speed;
+                    m.facingRight = true;
+                }
+
+                if (minDistance < 30 && m.timer <= 0) {
+                    takeDamage(closestPlayer.id, config.damage);
+                    m.timer = 60; 
+                }
+            } else {
+                m.velX = 0;
+            }
+
+            if (m.timer > 0) m.timer--;
+
+        } else {
+            m.timer--;
+            if (m.timer <= 0) {
+                m.timer = Math.floor(Math.random() * 100) + 50;
+                const r = Math.random();
+                if (r < 0.3) m.velX = 0; 
+                else if (r < 0.6) { m.velX = speed; m.facingRight = true; } 
+                else { m.velX = -speed; m.facingRight = false; }
+            }
         }
-        if (m.inWater) m.velY = -2; 
+
+        if (m.inWater) m.velY = -2;
         else {
             const checkX = m.velX > 0 ? m.x + m.width + 2 : m.x - 2;
-            if (m.velX !== 0 && m.grounded && isSolid(checkX, m.y + m.height - 5)) m.velY = MOBS_CONFIG.cow.jumpForce;
+            const tile = getTile(Math.floor(checkX / TILE_SIZE), Math.floor((m.y + m.height - 5) / TILE_SIZE), chunks, worldChanges);
+            const solid = !(tile === 0 || tile === 3 || tile === 4 || tile === 12);
+            if (m.velX !== 0 && m.grounded && solid) m.velY = config.jumpForce;
         }
-        applyPhysics(m);
+        applyPhysics(m, chunks, worldChanges);
     }
 
     for (let id in players) {
         let p = players[id];
         const speed = p.inWater ? 2.5 : 5;
         p.velX = 0;
-        
+
         if (!p.isDead) {
+            if (p.regenCooldown > 0) {
+                p.regenCooldown--;
+            } else if (p.hp < p.maxHp && gameTime % 30 === 0) {
+                p.hp += 1;
+            }
+
             if (p.inputs.left) p.velX = -speed;
             if (p.inputs.right) p.velX = speed;
 
             if (p.inputs.jump) {
-                if (p.grounded) { 
-                    p.velY = -11; 
-                    p.grounded = false; 
-                } 
+                if (p.grounded) {
+                    p.velY = -11;
+                    p.grounded = false;
+                }
                 else if (p.inWater) {
                     if (!p.prevJump) {
-                        p.velY = -6.5; 
-                    } 
+                        p.velY = -6.5;
+                    }
                     else if (p.velY > -2.5) {
                         p.velY -= 0.5;
                     }
@@ -374,7 +224,7 @@ setInterval(() => {
         }
         p.prevJump = p.inputs.jump;
 
-        applyPhysics(p);
+        applyPhysics(p, chunks, worldChanges, takeDamage);
 
         const pChunkX = Math.floor(p.x / (CHUNK_SIZE * TILE_SIZE));
         for (let i = -2; i <= 2; i++) if (!chunks[pChunkX + i]) chunkQueue.add(pChunkX + i);
@@ -395,17 +245,17 @@ function handleCommand(socket, msg) {
             const newNick = args.join(' ').substring(0, 15);
             if (newNick && players[socket.id]) {
                 const oldNick = players[socket.id].nick;
-                if (oldNick !== "Gracz") db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", [oldNick, players[socket.id].x, players[socket.id].y]);
+                if (oldNick !== "Gracz") savePlayer(oldNick, players[socket.id].x, players[socket.id].y);
                 players[socket.id].nick = newNick;
                 io.emit('playerNickUpdate', { id: socket.id, nick: newNick });
-                socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `OK` });
+                socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `Zmieniono nick na ${newNick}` });
             }
             break;
         case 'tp':
             if (args.length >= 2 && players[socket.id]) {
                 players[socket.id].x = parseInt(args[0]) * TILE_SIZE;
                 players[socket.id].y = parseInt(args[1]) * TILE_SIZE;
-                socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `TP` });
+                socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: 'Przeteleportowano.' });
             }
             break;
     }
@@ -415,33 +265,37 @@ io.on('connection', (socket) => {
     const spawnGridX = Math.floor((Math.random() - 0.5) * 40);
     const spawnGridY = getTerrainHeight(spawnGridX);
     const spawnX = spawnGridX * TILE_SIZE;
-    const spawnY = spawnGridY * TILE_SIZE - 40; 
+    const spawnY = spawnGridY * TILE_SIZE - 40;
 
-    players[socket.id] = { 
+    players[socket.id] = {
         id: socket.id,
         isPlayer: true,
         isDead: false,
         hp: 100,
         maxHp: 100,
-        x: spawnX, y: spawnY, width: 20, height: 40, velX: 0, velY: 0, grounded: false, inWater: false, 
+        x: spawnX, y: spawnY, width: 20, height: 40, velX: 0, velY: 0, grounded: false, inWater: false,
         nick: "Gracz", color: '#' + Math.floor(Math.random()*16777215).toString(16),
         inputs: { left: false, right: false, jump: false },
-        prevJump: false
+        prevJump: false,
+        regenCooldown: 0
     };
 
     socket.emit('initWorld', { chunks, worldChanges, dayDuration: DAY_DURATION });
 
-    socket.on('setNick', (nick) => { 
+    socket.on('setNick', (nick) => {
         if (players[socket.id]) {
             const cleanNick = nick.substring(0, 15);
-            players[socket.id].nick = cleanNick; 
-            
-            db.get("SELECT x, y FROM players WHERE nick = ?", [cleanNick], (err, row) => {
+            players[socket.id].nick = cleanNick;
+
+            loadPlayer(cleanNick, (err, row) => {
                 if (err) return;
                 if (row) {
                     players[socket.id].x = row.x;
                     players[socket.id].y = row.y;
-                    socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `OK` });
+                    socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `Witaj ponownie, ${cleanNick}!` });
+                    socket.broadcast.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${cleanNick} powrócił do gry!` });
+                } else {
+                    io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${cleanNick} dołączył do serwera!` });
                 }
             });
         }
@@ -468,7 +322,8 @@ io.on('connection', (socket) => {
         if (p && p.isDead) {
             p.hp = p.maxHp;
             p.isDead = false;
-            
+            p.regenCooldown = 0;
+
             const spawnGridX = Math.floor((Math.random() - 0.5) * 40);
             const spawnGridY = getTerrainHeight(spawnGridX);
             p.x = spawnGridX * TILE_SIZE;
@@ -482,23 +337,27 @@ io.on('connection', (socket) => {
     socket.on('shoot', (target) => {
         const shooter = players[socket.id];
         if (!shooter || shooter.isDead) return;
-        
+
         socket.broadcast.emit('playerShoot', { x1: shooter.x + shooter.width/2, y1: shooter.y + shooter.height/2, x2: target.x, y2: target.y });
-        
+
         for (let id in mobs) {
             let m = mobs[id];
             if (target.x >= m.x && target.x <= m.x + m.width && target.y >= m.y && target.y <= m.y + m.height) {
-                delete mobs[id];
-                break; 
+                m.hp -= 25;
+                io.emit('damageText', { x: m.x + m.width/2, y: m.y - 10, dmg: 25 });
+                if (m.hp <= 0) {
+                    delete mobs[id];
+                }
+                break;
             }
         }
 
         for (let id in players) {
-            if (id === socket.id) continue; 
+            if (id === socket.id) continue;
             let p = players[id];
             if (target.x >= p.x && target.x <= p.x + p.width && target.y >= p.y && target.y <= p.y + p.height && !p.isDead) {
-                takeDamage(id, 25); 
-                break; 
+                takeDamage(id, 25);
+                break;
             }
         }
     });
@@ -507,27 +366,27 @@ io.on('connection', (socket) => {
         if (players[socket.id] && players[socket.id].isDead) return;
 
         const { x, y, type } = data;
-        const currentTile = getTile(x, y);
-        if (currentTile === 99) return; 
-        if (type !== 0) { 
+        const currentTile = getTile(x, y, chunks, worldChanges);
+        if (currentTile === 99) return;
+        if (type !== 0) {
             const isReplaceable = (currentTile === 0 || currentTile === 4 || currentTile === 12);
-            if (!isReplaceable) return; 
+            if (!isReplaceable) return;
             function isSupport(t) { return t !== 0 && t !== 12 && t !== 4 && t !== 99; }
-            if (!isSupport(getTile(x, y - 1)) && !isSupport(getTile(x, y + 1)) && !isSupport(getTile(x - 1, y)) && !isSupport(getTile(x + 1, y))) return; 
+            if (!isSupport(getTile(x, y - 1, chunks, worldChanges)) && !isSupport(getTile(x, y + 1, chunks, worldChanges)) && !isSupport(getTile(x - 1, y, chunks, worldChanges)) && !isSupport(getTile(x + 1, y, chunks, worldChanges))) return;
         } else { if (currentTile === 0 || currentTile === 12) return; }
-        
+
         worldChanges[`${x},${y}`] = type;
-        io.emit('blockUpdate', { x, y, type }); 
+        io.emit('blockUpdate', { x, y, type });
     });
 
-    socket.on('disconnect', () => { 
+    socket.on('disconnect', () => {
         if(players[socket.id]) {
             const p = players[socket.id];
             if (p.nick && p.nick !== "Gracz" && !p.isDead) {
-                db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", [p.nick, p.x, p.y]);
+                savePlayer(p.nick, p.x, p.y);
             }
-            io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `DC` });
-            delete players[socket.id]; 
+            io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${p.nick} opuścił serwer.` });
+            delete players[socket.id];
         }
     });
 });
