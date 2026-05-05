@@ -13,21 +13,27 @@ function getTile(gridX, gridY, chunks, worldChanges) {
 
 function isSolid(x, y, chunks, worldChanges) {
     const tile = getTile(Math.floor(x / TILE_SIZE), Math.floor(y / TILE_SIZE), chunks, worldChanges);
-    return !(tile === 0 || tile === 3 || tile === 4 || tile === 12);
+    return !(tile === 0 || tile === 3 || tile === 4 || tile === 12 || tile === 14);
 }
 
-function applyPhysics(entity, chunks, worldChanges, takeDamageCallback) {
+function applyPhysics(entity, dimensions, takeDamageCallback) {
+    const dim = entity.dimension || 'earth';
+    const chunks = dimensions[dim].chunks;
+    const worldChanges = dimensions[dim].worldChanges;
+
+    const currentGravity = (dim === 'moon') ? GRAVITY * 0.3 : GRAVITY;
+
     const gridX = Math.floor((entity.x + entity.width/2) / TILE_SIZE);
     const centerY = Math.floor((entity.y + entity.height/2) / TILE_SIZE);
     const feetY = Math.floor((entity.y + entity.height - 2) / TILE_SIZE);
     entity.inWater = (getTile(gridX, centerY, chunks, worldChanges) === 12) || (getTile(gridX, feetY, chunks, worldChanges) === 12);
 
-    if (entity.inWater) {
-        entity.velY += GRAVITY * 0.4;
+    if (entity.inWater && dim === 'earth') {
+        entity.velY += currentGravity * 0.4;
         if (entity.velY > 4) entity.velY = 4;
         entity.highestY = undefined;
     } else {
-        entity.velY += GRAVITY;
+        entity.velY += currentGravity;
         if (entity.velY > 12) entity.velY = 12;
     }
 
@@ -46,7 +52,7 @@ function applyPhysics(entity, chunks, worldChanges, takeDamageCallback) {
             entity.y = Math.floor((entity.y + entity.height) / TILE_SIZE) * TILE_SIZE - entity.height;
             entity.grounded = true;
 
-            if (entity.isPlayer && entity.highestY !== undefined && !entity.isDead) {
+            if (entity.isPlayer && entity.highestY !== undefined && !entity.isDead && dim === 'earth') {
                 const fallDist = (entity.y - entity.highestY) / TILE_SIZE;
                 if (fallDist > 6) {
                     const dmg = Math.floor((fallDist - 6) * 10);

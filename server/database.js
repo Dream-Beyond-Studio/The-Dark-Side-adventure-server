@@ -35,19 +35,23 @@ const db = new sqlite3.Database(path.join(dbDir, 'game.db'), (err) => {
         db.run(`CREATE TABLE IF NOT EXISTS players (
             nick TEXT PRIMARY KEY,
             x REAL,
-            y REAL
-        )`);
+            y REAL,
+            dimension TEXT DEFAULT 'earth'
+        )`, () => {
+            db.run("ALTER TABLE players ADD COLUMN dimension TEXT DEFAULT 'earth'", (err) => {});
+        });
     }
 });
 
-function savePlayer(nick, x, y) {
+function savePlayer(nick, x, y, dimension) {
     if (nick && nick !== "Gracz") {
-        db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", [nick, x, y]);
+        const dim = dimension || 'earth';
+        db.run("INSERT OR REPLACE INTO players (nick, x, y, dimension) VALUES (?, ?, ?, ?)", [nick, x, y, dim]);
     }
 }
 
 function loadPlayer(nick, callback) {
-    db.get("SELECT x, y FROM players WHERE nick = ?", [nick], callback);
+    db.get("SELECT x, y, dimension FROM players WHERE nick = ?", [nick], callback);
 }
 
 function saveAllPlayers(players, callback) {
@@ -56,7 +60,8 @@ function saveAllPlayers(players, callback) {
         for (let id in players) {
             const p = players[id];
             if (p.nick && p.nick !== "Gracz" && !p.isDead) {
-                db.run("INSERT OR REPLACE INTO players (nick, x, y) VALUES (?, ?, ?)", [p.nick, p.x, p.y]);
+                const dim = p.dimension || 'earth';
+                db.run("INSERT OR REPLACE INTO players (nick, x, y, dimension) VALUES (?, ?, ?, ?)", [p.nick, p.x, p.y, dim]);
             }
         }
         db.run("COMMIT", callback);

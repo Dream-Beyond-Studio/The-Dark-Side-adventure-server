@@ -1,6 +1,6 @@
 {
   "name": "the-dark-side-server-a",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "description": "Server",
   "main": "server.js",
   "scripts": {

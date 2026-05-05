@@ -5,7 +5,10 @@ function pseudoRandom(x, y) {
     return n - Math.floor(n);
 }
 
-function getTerrainHeight(worldX) {
+function getTerrainHeight(worldX, dimension = 'earth') {
+    if (dimension === 'moon') {
+        return Math.floor(80 + Math.sin(worldX * 0.1) * 4 + Math.sin(worldX * 0.02) * 8);
+    }
     let h = 30 + Math.sin(worldX * 0.1) * 8 + Math.sin(worldX * 0.05) * 12 + 5;
     const oceanNoise = Math.sin(worldX * 0.02);
     if (oceanNoise > 0.4) h += (oceanNoise - 0.4) * 50;
@@ -55,16 +58,24 @@ function spawnVein(chunkData, centerX, centerY, oreID, worldX) {
     }
 }
 
-function generateChunkData(chunkX) {
+function generateChunkData(chunkX, dimension = 'earth') {
     const chunkData = [];
     for (let y = 0; y < MAP_HEIGHT; y++) chunkData[y] = new Array(CHUNK_SIZE).fill(0);
 
+    const isMoon = dimension === 'moon';
+
     for (let x = 0; x < CHUNK_SIZE; x++) {
         const worldX = chunkX * CHUNK_SIZE + x;
-        const surfaceY = getTerrainHeight(worldX);
+        const surfaceY = getTerrainHeight(worldX, dimension);
 
         for (let y = 0; y < MAP_HEIGHT; y++) {
             if (y >= MAP_HEIGHT - 3) { chunkData[y][x] = 99; continue; }
+
+            if (isMoon) {
+                if (y < surfaceY) chunkData[y][x] = 0;
+                else chunkData[y][x] = 5; 
+                continue;
+            }
 
             const cave = isCave(worldX, y);
 
@@ -75,9 +86,7 @@ function generateChunkData(chunkX) {
                  if (y >= SEA_LEVEL) chunkData[y][x] = 2;
                  else {
                      if (cave) { chunkData[y][x] = 0; }
-                     else {
-                         chunkData[y][x] = 1;
-                     }
+                     else { chunkData[y][x] = 1; }
                  }
             }
             else {
@@ -91,25 +100,27 @@ function generateChunkData(chunkX) {
         }
     }
 
-    for (let x = 0; x < CHUNK_SIZE; x++) {
-        const worldX = chunkX * CHUNK_SIZE + x;
-        const surfaceY = getTerrainHeight(worldX);
+    if (!isMoon) {
+        for (let x = 0; x < CHUNK_SIZE; x++) {
+            const worldX = chunkX * CHUNK_SIZE + x;
+            const surfaceY = getTerrainHeight(worldX, 'earth');
 
-        if (chunkData[surfaceY] && chunkData[surfaceY][x] === 1) {
-            if (x >= 3 && x <= CHUNK_SIZE - 4 && pseudoRandom(worldX, surfaceY) < 0.08) {
-                createTree(chunkData, x, surfaceY, worldX);
+            if (chunkData[surfaceY] && chunkData[surfaceY][x] === 1) {
+                if (x >= 3 && x <= CHUNK_SIZE - 4 && pseudoRandom(worldX, surfaceY) < 0.08) {
+                    createTree(chunkData, x, surfaceY, worldX);
+                }
             }
-        }
 
-        for (let y = 0; y < MAP_HEIGHT; y++) {
-            if (chunkData[y][x] === 5) {
-                const rand = pseudoRandom(worldX, y);
-                if (rand < 0.05) {
-                    let oreID = 6;
-                    if (y > 60 && rand < 0.004) oreID = 9;
-                    else if (y > 50 && rand < 0.01) oreID = 8;
-                    else if (y > 40 && rand < 0.02) oreID = 7;
-                    spawnVein(chunkData, x, y, oreID, worldX);
+            for (let y = 0; y < MAP_HEIGHT; y++) {
+                if (chunkData[y][x] === 5) {
+                    const rand = pseudoRandom(worldX, y);
+                    if (rand < 0.05) {
+                        let oreID = 6;
+                        if (y > 60 && rand < 0.004) oreID = 9;
+                        else if (y > 50 && rand < 0.01) oreID = 8;
+                        else if (y > 40 && rand < 0.02) oreID = 7;
+                        spawnVein(chunkData, x, y, oreID, worldX);
+                    }
                 }
             }
         }
