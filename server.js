@@ -18,6 +18,9 @@ let mobIdCounter = 0;
 let gameTime = 4000;
 let daysPassed = 0;
 
+let wormholeTimer = 0;
+let isWormholeActive = false;
+
 let dimensions = {
     earth: { chunks: {}, worldChanges: {}, chunkQueue: new Set() },
     moon: { chunks: {}, worldChanges: {}, chunkQueue: new Set() }
@@ -48,6 +51,27 @@ function getSurfaceGridY(gridX, dim) {
     return 40;
 }
 
+function getSafeSpawnY(spawnX, entityWidth, dim = 'earth') {
+    const gridX = Math.floor(spawnX / TILE_SIZE);
+    const rightGridX = Math.floor((spawnX + entityWidth) / TILE_SIZE);
+    let gridY = getTerrainHeight(gridX, dim);
+    
+    function isTileSolid(gx, gy) {
+        const t = getTile(gx, gy, dimensions[dim].chunks, dimensions[dim].worldChanges);
+        return !(t === 0 || t === 3 || t === 4 || t === 12 || t === 15 || t === 99);
+    }
+
+    while (gridY > 0 && (
+        isTileSolid(gridX, gridY) || 
+        isTileSolid(gridX, gridY - 1) ||
+        isTileSolid(rightGridX, gridY) || 
+        isTileSolid(rightGridX, gridY - 1)
+    )) {
+        gridY--;
+    }
+    return gridY * TILE_SIZE;
+}
+
 function takeDamage(playerId, amount) {
     let p = players[playerId];
     if (!p || p.isDead) return;
@@ -61,6 +85,29 @@ function takeDamage(playerId, amount) {
         p.isDead = true;
         io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${p.nick} zginął.` });
     }
+}
+
+function hasLineOfSight(entity1, entity2, chunks, worldChanges) {
+    const x1 = entity1.x + entity1.width / 2;
+    const y1 = entity1.y + entity1.height / 2;
+    const x2 = entity2.x + entity2.width / 2;
+    const y2 = entity2.y + entity2.height / 2;
+    
+    const dist = Math.hypot(x2 - x1, y2 - y1);
+    const steps = Math.ceil(dist / (TILE_SIZE / 2));
+    
+    for (let i = 0; i <= steps; i++) {
+        const currentX = x1 + (x2 - x1) * (i / steps);
+        const currentY = y1 + (y2 - y1) * (i / steps);
+        const gridX = Math.floor(currentX / TILE_SIZE);
+        const gridY = Math.floor(currentY / TILE_SIZE);
+        const tile = getTile(gridX, gridY, chunks, worldChanges);
+        
+        if (tile !== 0 && tile !== 3 && tile !== 4 && tile !== 12 && tile !== 14 && tile !== 15 && tile !== 99) {
+            return false;
+        }
+    }
+    return true;
 }
 
 function spawnUfoStructure(gridX, gridY, dim) {
@@ -163,6 +210,16 @@ setInterval(() => {
         daysPassed++;
     }
 
+    wormholeTimer++;
+    if (wormholeTimer === 9000) {
+        isWormholeActive = true;
+        io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: 'Księżyc zbliża się do tunelu czasoprzestrzennego. Okno portali zostało aktywowane!' });
+    } else if (wormholeTimer >= 10000) {
+        isWormholeActive = false;
+        wormholeTimer = 0;
+        io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: 'Oddalamy się od anomalii. Portale zostały dezaktywowane i uśpione.' });
+    }
+
     const progress = gameTime / DAY_DURATION;
     const isNight = progress > 0.8 || progress < 0.2;
 
@@ -170,15 +227,16 @@ setInterval(() => {
         saveAllPlayers(players);
     }
 
-    const playerIds = Object.keys(players).filter(id => players[id].dimension === 'earth');
+    const earthPlayerIds = Object.keys(players).filter(id => players[id].dimension === 'earth');
+    const moonPlayerIds = Object.keys(players).filter(id => players[id].dimension === 'moon');
 
-    if (isNight && !isUfoEventTriggered && daysPassed >= 1 && playerIds.length > 0) {
+    if (isNight && !isUfoEventTriggered && daysPassed >= 1 && earthPlayerIds.length > 0) {
         triggerUfoEvent();
     }
 
-    if (playerIds.length > 0 && Object.keys(mobs).filter(id => mobs[id].dimension === 'earth').length < 12) {
+    if (earthPlayerIds.length > 0 && Object.keys(mobs).filter(id => mobs[id].dimension === 'earth').length < 12) {
         if (Math.random() < 0.015) {
-            const p = players[playerIds[Math.floor(Math.random() * playerIds.length)]];
+            const p = players[earthPlayerIds[Math.floor(Math.random() * earthPlayerIds.length)]];
             const chunkX = Math.floor(p.x / (CHUNK_SIZE * TILE_SIZE));
 
             if (dimensions['earth'].chunks[chunkX]) {
@@ -207,12 +265,54 @@ setInterval(() => {
         }
     }
 
+    if (moonPlayerIds.length > 0 && Object.keys(mobs).filter(id => mobs[id].dimension === 'moon').length < 8) {
+        if (Math.random() < 0.008) {
+            const p = players[moonPlayerIds[Math.floor(Math.random() * moonPlayerIds.length)]];
+            const chunkX = Math.floor(p.x / (CHUNK_SIZE * TILE_SIZE));
+
+            if (dimensions['moon'].chunks[chunkX]) {
+                const id = mobIdCounter++;
+                let type = Math.random() < 0.5 ? 'alien' : 'crawler';
+                
+                const spawnDirection = Math.random() < 0.5 ? -1 : 1;
+                const spawnDistance = 200 + Math.random() * 400;
+                const spawnX = p.x + (spawnDirection * spawnDistance);
+                const gridX = Math.floor(spawnX / TILE_SIZE);
+                
+                let spawnY = -1;
+                const surfaceY = getSurfaceGridY(gridX, 'moon');
+                
+                if (Math.random() < 0.6) {
+                    for (let y = surfaceY + 2; y < MAP_HEIGHT - 2; y++) {
+                        const t1 = getTile(gridX, y, dimensions['moon'].chunks, dimensions['moon'].worldChanges);
+                        const t2 = getTile(gridX, y + 1, dimensions['moon'].chunks, dimensions['moon'].worldChanges);
+                        if (t1 === 0 && t2 !== 0 && t2 !== 99) {
+                            spawnY = (y * TILE_SIZE) - MOBS_CONFIG[type].height;
+                            break;
+                        }
+                    }
+                }
+
+                if (spawnY === -1) {
+                    spawnY = (surfaceY * TILE_SIZE) - MOBS_CONFIG[type].height;
+                }
+                
+                mobs[id] = { 
+                    id: id, type: type, dimension: 'moon', x: spawnX, y: spawnY, 
+                    width: MOBS_CONFIG[type].width, height: MOBS_CONFIG[type].height, 
+                    velX: 0, velY: 0, grounded: false, inWater: false, facingRight: true, timer: 0,
+                    hp: MOBS_CONFIG[type].maxHp, maxHp: MOBS_CONFIG[type].maxHp
+                };
+            }
+        }
+    }
+
     for (let id in mobs) {
         let m = mobs[id];
         const config = MOBS_CONFIG[m.type];
         const speed = m.inWater ? config.speed * 0.5 : config.speed;
 
-        if (m.type === 'zombie' || m.type === 'alien') {
+        if (m.type === 'zombie' || m.type === 'alien' || m.type === 'crawler') {
             if (m.type === 'zombie' && !isNight && m.dimension === 'earth') {
                 if (gameTime % 30 === 0) {
                     m.hp -= 10;
@@ -246,7 +346,12 @@ setInterval(() => {
                     m.facingRight = true;
                 }
 
-                if (m.type === 'alien' && minDistance < 350 && minDistance > 50 && m.timer <= 0) {
+                let canSeePlayer = false;
+                if ((m.type === 'alien' || m.type === 'crawler') && minDistance < 350) {
+                    canSeePlayer = hasLineOfSight(m, closestPlayer, dimensions[m.dimension].chunks, dimensions[m.dimension].worldChanges);
+                }
+
+                if ((m.type === 'alien' || m.type === 'crawler') && minDistance < 350 && minDistance > 50 && m.timer <= 0 && canSeePlayer) {
                     m.velX = 0;
                     io.emit('playerShoot', { x1: m.x + m.width/2, y1: m.y + 10, x2: closestPlayer.x + closestPlayer.width/2, y2: closestPlayer.y + closestPlayer.height/2, dimension: m.dimension, color: '#00FF00' });
                     takeDamage(closestPlayer.id, config.damage);
@@ -284,7 +389,7 @@ setInterval(() => {
             const tileLower = getTile(Math.floor(frontX / TILE_SIZE), Math.floor((m.y + m.height - 5) / TILE_SIZE), dimensions[m.dimension].chunks, dimensions[m.dimension].worldChanges);
             const tileUpper = getTile(Math.floor(frontX / TILE_SIZE), Math.floor((m.y + m.height - TILE_SIZE - 5) / TILE_SIZE), dimensions[m.dimension].chunks, dimensions[m.dimension].worldChanges);
             
-            function isBlockSolid(t) { return !(t === 0 || t === 3 || t === 4 || t === 12 || t === 14 || t === 99); }
+            function isBlockSolid(t) { return !(t === 0 || t === 3 || t === 4 || t === 12 || t === 14 || t === 15 || t === 99); }
             if (m.velX !== 0 && m.grounded && (isBlockSolid(tileLower) || isBlockSolid(tileUpper))) {
                 m.velY = config.jumpForce;
             }
@@ -392,7 +497,7 @@ setInterval(() => {
 }, 1000 / 60);
 
 setInterval(() => {
-    io.emit('gameState', { players, mobs, time: gameTime });
+    io.emit('gameState', { players, mobs, time: gameTime, wormhole: isWormholeActive });
 }, 1000 / 20);
 
 function handleCommand(socket, msg) {
@@ -496,6 +601,7 @@ io.on('connection', (socket) => {
             let storyText = 'Jesteś weteranem wojennym. Twoim głównym celem jest czysta eksterminacja.';
             if (data.characterClass === 'scientist') storyText = 'Jesteś naukowcem. Zbadaj dziwne minerały na tej planecie.';
             if (data.characterClass === 'engineer') storyText = 'Jesteś inżynierem. Skonstruuj bazę zdolną oprzeć się inwazji.';
+            if (data.characterClass === 'scout') storyText = 'Jesteś zwiadowcą. Zbadaj teren i przetrwaj w nieznanym środowisku.';
 
             loadPlayer(cleanNick, (err, row) => {
                 if (row) {
@@ -542,6 +648,12 @@ io.on('connection', (socket) => {
                     players[socket.id].flightDestination = 'earth';
                     socket.emit('chatMessage', { id: 'SYSTEM', nick: 'STORY', text: 'Inicjalizacja powrotu...' });
                 }
+            } else if (tile === 15) {
+                if (isWormholeActive) {
+                    socket.emit('chatMessage', { id: 'SYSTEM', nick: 'PORTAL', text: 'Portal jest połączony z tunelem czasoprzestrzennym! Wymiary docelowe nie są jeszcze znane.' });
+                } else {
+                    socket.emit('chatMessage', { id: 'SYSTEM', nick: 'PORTAL', text: 'Brak zasilania. Tunel czasoprzestrzenny jest obecnie poza zasięgiem.' });
+                }
             }
         }
     });
@@ -568,12 +680,13 @@ io.on('connection', (socket) => {
             p.hp = p.maxHp; p.air = p.maxAir;
             p.isDead = false; p.isFlying = false; p.flightTimer = 0;
             p.regenCooldown = 0; p.inputs = { left: false, right: false, jump: false };
-            p.prevJump = false; p.dimension = 'earth'; 
+            p.prevJump = false; 
             
-            socket.emit('dimensionChange', { dimension: 'earth' });
+            const currentDim = p.dimension;
+            socket.emit('dimensionChange', { dimension: currentDim });
             
             const spawnGridX = Math.floor((Math.random() - 0.5) * 40);
-            const gridY = getSurfaceGridY(spawnGridX, 'earth');
+            const gridY = getSurfaceGridY(spawnGridX, currentDim);
             p.x = spawnGridX * TILE_SIZE; 
             p.y = (gridY - 1) * TILE_SIZE;
             p.velY = 0; p.velX = 0; p.highestY = undefined;
@@ -628,7 +741,7 @@ io.on('connection', (socket) => {
         if (type !== 0) {
             const isReplaceable = (currentTile === 0 || currentTile === 4 || currentTile === 12);
             if (!isReplaceable) return;
-            function isSupport(t) { return t !== 0 && t !== 12 && t !== 4 && t !== 99 && t !== 14; }
+            function isSupport(t) { return t !== 0 && t !== 12 && t !== 4 && t !== 99 && t !== 14 && t !== 15; }
             if (!isSupport(getTile(x, y - 1, dimensions[dim].chunks, dimensions[dim].worldChanges)) && !isSupport(getTile(x, y + 1, dimensions[dim].chunks, dimensions[dim].worldChanges)) && !isSupport(getTile(x - 1, y, dimensions[dim].chunks, dimensions[dim].worldChanges)) && !isSupport(getTile(x + 1, y, dimensions[dim].chunks, dimensions[dim].worldChanges))) return;
         } else { if (currentTile === 0 || currentTile === 12) return; }
 

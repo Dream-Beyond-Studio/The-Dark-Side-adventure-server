@@ -63,6 +63,7 @@ function generateChunkData(chunkX, dimension = 'earth') {
     for (let y = 0; y < MAP_HEIGHT; y++) chunkData[y] = new Array(CHUNK_SIZE).fill(0);
 
     const isMoon = dimension === 'moon';
+    const hasBase = isMoon && pseudoRandom(chunkX, 0) < 0.1;
 
     for (let x = 0; x < CHUNK_SIZE; x++) {
         const worldX = chunkX * CHUNK_SIZE + x;
@@ -98,6 +99,35 @@ function generateChunkData(chunkX, dimension = 'earth') {
                 }
             }
         }
+    }
+
+    if (hasBase) {
+        const centerX = 8;
+        const surfaceY = getTerrainHeight(chunkX * CHUNK_SIZE + centerX, 'moon');
+        const roomTop = 95;
+        const roomBottom = 110;
+
+        for (let y = surfaceY; y <= roomTop; y++) {
+            chunkData[y][centerX - 1] = 13;
+            chunkData[y][centerX] = 0;
+            chunkData[y][centerX + 1] = 0;
+            chunkData[y][centerX + 2] = 13;
+        }
+
+        for (let y = roomTop; y <= roomBottom; y++) {
+            for (let x = 2; x <= 14; x++) {
+                if (y === roomTop || y === roomBottom || x === 2 || x === 14) {
+                    chunkData[y][x] = 13;
+                } else {
+                    chunkData[y][x] = 0;
+                }
+            }
+        }
+
+        chunkData[roomBottom - 1][centerX] = 15;
+        chunkData[roomBottom - 1][centerX + 1] = 15;
+        chunkData[roomBottom - 2][centerX] = 15;
+        chunkData[roomBottom - 2][centerX + 1] = 15;
     }
 
     if (!isMoon) {
