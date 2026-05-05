@@ -5,10 +5,10 @@ const io = require('socket.io')(http, { cors: { origin: "*" } });
 const path = require('path');
 const readline = require('readline');
 
-const { TILE_SIZE, CHUNK_SIZE, DAY_DURATION, MOBS_CONFIG } = require('./serverConfig');
-const { log, savePlayer, loadPlayer, saveAllPlayers } = require('./database');
-const { generateChunkData, getTerrainHeight } = require('./worldGenerator');
-const { applyPhysics, getTile } = require('./physics');
+const { TILE_SIZE, CHUNK_SIZE, DAY_DURATION, MOBS_CONFIG } = require('./server/serverConfig');
+const { log, savePlayer, loadPlayer, saveAllPlayers } = require('./server/database');
+const { generateChunkData, getTerrainHeight } = require('./server/worldGenerator');
+const { applyPhysics, getTile } = require('./server/physics');
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -19,6 +19,27 @@ let chunks = {};
 let worldChanges = {};
 let gameTime = 0;
 let chunkQueue = new Set();
+
+function getSafeSpawnY(spawnX, entityWidth) {
+    const gridX = Math.floor(spawnX / TILE_SIZE);
+    const rightGridX = Math.floor((spawnX + entityWidth) / TILE_SIZE);
+    let gridY = getTerrainHeight(gridX);
+    
+    function isTileSolid(gx, gy) {
+        const t = getTile(gx, gy, chunks, worldChanges);
+        return !(t === 0 || t === 3 || t === 4 || t === 12 || t === 99);
+    }
+
+    while (gridY > 0 && (
+        isTileSolid(gridX, gridY) || 
+        isTileSolid(gridX, gridY - 1) ||
+        isTileSolid(rightGridX, gridY) || 
+        isTileSolid(rightGridX, gridY - 1)
+    )) {
+        gridY--;
+    }
+    return gridY * TILE_SIZE;
+}
 
 function takeDamage(playerId, amount) {
     let p = players[playerId];
@@ -31,7 +52,7 @@ function takeDamage(playerId, amount) {
     if (p.hp <= 0) {
         p.hp = 0;
         p.isDead = true;
-        io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${p.nick} zginął.` });
+        io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${p.nick} utonął.` });
     }
 }
 
@@ -95,30 +116,40 @@ setInterval(() => {
     if (playerIds.length > 0 && Object.keys(mobs).length < 12) {
         if (Math.random() < 0.015) {
             const p = players[playerIds[Math.floor(Math.random() * playerIds.length)]];
-            const id = mobIdCounter++;
-            const type = isNight ? 'zombie' : 'cow';
-            
-            const spawnX = p.x + (Math.random() - 0.5) * 800;
-            const gridX = Math.floor(spawnX / TILE_SIZE);
-            const gridY = getTerrainHeight(gridX);
-            const spawnY = gridY * TILE_SIZE - MOBS_CONFIG[type].height;
-            
-            mobs[id] = { 
-                id: id, 
-                type: type, 
-                x: spawnX, 
-                y: spawnY, 
-                width: MOBS_CONFIG[type].width, 
-                height: MOBS_CONFIG[type].height, 
-                velX: 0, 
-                velY: 0, 
-                grounded: false, 
-                inWater: false, 
-                facingRight: true, 
-                timer: 0,
-                hp: MOBS_CONFIG[type].maxHp,
-                maxHp: MOBS_CONFIG[type].maxHp
-            };
+            const chunkX = Math.floor(p.x / (CHUNK_SIZE * TILE_SIZE));
+
+            if (chunks[chunkX]) {
+                const id = mobIdCounter++;
+                let type = 'zombie';
+                if (!isNight) {
+                    const passives = ['cow', 'pig', 'sheep'];
+                    type = passives[Math.floor(Math.random() * passives.length)];
+                }
+                
+                const spawnDirection = Math.random() < 0.5 ? -1 : 1;
+                const spawnDistance = 500 + Math.random() * 500;
+                const spawnX = p.x + (spawnDirection * spawnDistance);
+                
+                const safeY = getSafeSpawnY(spawnX, MOBS_CONFIG[type].width);
+                const spawnY = safeY - MOBS_CONFIG[type].height;
+                
+                mobs[id] = { 
+                    id: id, 
+                    type: type, 
+                    x: spawnX, 
+                    y: spawnY, 
+                    width: MOBS_CONFIG[type].width, 
+                    height: MOBS_CONFIG[type].height, 
+                    velX: 0, 
+                    velY: 0, 
+                    grounded: false, 
+                    inWater: false, 
+                    facingRight: true, 
+                    timer: 0,
+                    hp: MOBS_CONFIG[type].maxHp,
+                    maxHp: MOBS_CONFIG[type].maxHp
+                };
+            }
         }
     }
 
@@ -203,9 +234,22 @@ setInterval(() => {
         p.velX = 0;
 
         if (!p.isDead) {
+            if (p.inWater) {
+                p.air -= 0.2;
+                if (p.air <= 0) {
+                    p.air = 0;
+                    if (gameTime % 30 === 0) {
+                        takeDamage(id, 10);
+                    }
+                }
+            } else {
+                p.air += 1;
+                if (p.air > p.maxAir) p.air = p.maxAir;
+            }
+
             if (p.regenCooldown > 0) {
                 p.regenCooldown--;
-            } else if (p.hp < p.maxHp && gameTime % 30 === 0) {
+            } else if (p.hp < p.maxHp && gameTime % 30 === 0 && p.air > 0) {
                 p.hp += 1;
             }
 
@@ -268,16 +312,16 @@ function handleCommand(socket, msg) {
 
 io.on('connection', (socket) => {
     const spawnGridX = Math.floor((Math.random() - 0.5) * 40);
-    const spawnGridY = getTerrainHeight(spawnGridX);
     const spawnX = spawnGridX * TILE_SIZE;
-    const spawnY = spawnGridY * TILE_SIZE - 40;
+    const safeY = getSafeSpawnY(spawnX, 20);
+    const spawnY = safeY - 40;
 
     players[socket.id] = {
         id: socket.id,
         isPlayer: true,
         isDead: false,
-        hp: 100,
-        maxHp: 100,
+        hp: 100, maxHp: 100,
+        air: 100, maxAir: 100,
         x: spawnX, y: spawnY, width: 20, height: 40, velX: 0, velY: 0, grounded: false, inWater: false,
         nick: "Gracz", color: '#' + Math.floor(Math.random()*16777215).toString(16),
         inputs: { left: false, right: false, jump: false },
@@ -317,7 +361,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('input', (inputs) => {
-        if (players[socket.id]) {
+        if (players[socket.id] && !players[socket.id].isDead) {
             players[socket.id].inputs = inputs;
         }
     });
@@ -326,15 +370,17 @@ io.on('connection', (socket) => {
         let p = players[socket.id];
         if (p && p.isDead) {
             p.hp = p.maxHp;
+            p.air = p.maxAir;
             p.isDead = false;
             p.regenCooldown = 0;
             p.inputs = { left: false, right: false, jump: false };
             p.prevJump = false;
 
             const spawnGridX = Math.floor((Math.random() - 0.5) * 40);
-            const spawnGridY = getTerrainHeight(spawnGridX);
-            p.x = spawnGridX * TILE_SIZE;
-            p.y = spawnGridY * TILE_SIZE - 40;
+            const spawnX = spawnGridX * TILE_SIZE;
+            const safeY = getSafeSpawnY(spawnX, 20);
+            p.x = spawnX;
+            p.y = safeY - 40;
             p.velY = 0;
             p.velX = 0;
             p.highestY = undefined;

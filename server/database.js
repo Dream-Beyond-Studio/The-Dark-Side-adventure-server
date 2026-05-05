@@ -2,18 +2,32 @@ const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
 
-const LOG_FILE = path.join(__dirname, 'server_logs.txt');
+const logsDir = path.join(__dirname, 'logs');
+const dbDir = path.join(__dirname, 'database');
+
+if (!fs.existsSync(logsDir)) {
+    fs.mkdirSync(logsDir, { recursive: true });
+}
+
+if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+}
 
 function log(category, message) {
     const now = new Date();
     const time = now.toLocaleTimeString();
     const date = now.toLocaleDateString();
+    
+    const fileNameDate = now.toISOString().split('T')[0];
+    const logFile = path.join(logsDir, `server_log_${fileNameDate}.txt`);
+
     if (category !== 'CMD_INPUT') console.log(`[${time}] [${category}] ${message}`);
     const fileLine = `[${date} ${time}] [${category}] ${message}\n`;
-    fs.appendFile(LOG_FILE, fileLine, (err) => { if (err) console.error(err); });
+    
+    fs.appendFile(logFile, fileLine, (err) => { if (err) console.error(err); });
 }
 
-const db = new sqlite3.Database(path.join(__dirname, 'game.db'), (err) => {
+const db = new sqlite3.Database(path.join(dbDir, 'game.db'), (err) => {
     if (err) {
         log('ERROR', err.message);
     } else {
