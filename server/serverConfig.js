@@ -14,6 +14,13 @@ const MOBS_CONFIG = {
     crawler: { width: 28, height: 16, speed: 2.2, jumpForce: -8, maxHp: 90, damage: 12 }
 };
 
+const RECIPES = [
+    { id: 10, count: 4, req: [{id: 3, count: 1}] },
+    { id: 11, count: 1, req: [{id: 5, count: 2}] },
+    { id: 16, count: 1, req: [{id: 10, count: 3}, {id: 4, count: 2}] },
+    { id: 999, count: 1, req: [{id: 9, count: 2}, {id: 3, count: 2}] }
+];
+
 module.exports = {
-    TILE_SIZE, CHUNK_SIZE, MAP_HEIGHT, SEA_LEVEL, GRAVITY, DAY_DURATION, MOBS_CONFIG
+    TILE_SIZE, CHUNK_SIZE, MAP_HEIGHT, SEA_LEVEL, GRAVITY, DAY_DURATION, MOBS_CONFIG, RECIPES
 };

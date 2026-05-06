@@ -5,8 +5,8 @@ const io = require('socket.io')(http, { cors: { origin: "*" } });
 const path = require('path');
 const readline = require('readline');
 
-const { TILE_SIZE, CHUNK_SIZE, MAP_HEIGHT, DAY_DURATION, MOBS_CONFIG } = require('./server/serverConfig');
-const { log, savePlayer, loadPlayer, saveAllPlayers } = require('./server/database');
+const { TILE_SIZE, CHUNK_SIZE, MAP_HEIGHT, DAY_DURATION, MOBS_CONFIG, RECIPES } = require('./server/serverConfig');
+const { log, savePlayer, loadPlayer, saveAllPlayers, saveWorldChanges, loadWorldChanges } = require('./server/database');
 const { generateChunkData, getTerrainHeight } = require('./server/worldGenerator');
 const { applyPhysics, getTile } = require('./server/physics');
 
@@ -26,10 +26,28 @@ let dimensions = {
     moon: { chunks: {}, worldChanges: {}, chunkQueue: new Set() }
 };
 
+loadWorldChanges((data) => {
+    if (data.earth) dimensions.earth.worldChanges = data.earth;
+    if (data.moon) dimensions.moon.worldChanges = data.moon;
+});
+
 let isUfoEventTriggered = false;
 let eventAliensAlive = 0;
 let ufoDoorUnlocked = false;
 let moonUfoBuilt = false;
+
+function shutdownServer() {
+    io.emit('chatMessage', { id: 'SERVER', nick: '[SERWER]', text: 'Zamykanie serwera...' });
+    saveAllPlayers(players, () => {
+        saveWorldChanges(dimensions, () => {
+            log('SYSTEM', 'STOP');
+            process.exit(0);
+        });
+    });
+}
+
+process.on('SIGINT', shutdownServer);
+process.on('SIGTERM', shutdownServer);
 
 function ensureChunkExists(gridX, dim) {
     const chunkX = Math.floor(gridX / CHUNK_SIZE);
@@ -58,7 +76,7 @@ function getSafeSpawnY(spawnX, entityWidth, dim = 'earth') {
     
     function isTileSolid(gx, gy) {
         const t = getTile(gx, gy, dimensions[dim].chunks, dimensions[dim].worldChanges);
-        return !(t === 0 || t === 3 || t === 4 || t === 12 || t === 15 || t === 99);
+        return !(t === 0 || t === 3 || t === 4 || t === 12 || t === 15 || t === 16 || t === 99);
     }
 
     while (gridY > 0 && (
@@ -103,7 +121,27 @@ function hasLineOfSight(entity1, entity2, chunks, worldChanges) {
         const gridY = Math.floor(currentY / TILE_SIZE);
         const tile = getTile(gridX, gridY, chunks, worldChanges);
         
-        if (tile !== 0 && tile !== 3 && tile !== 4 && tile !== 12 && tile !== 14 && tile !== 15 && tile !== 99) {
+        if (tile !== 0 && tile !== 3 && tile !== 4 && tile !== 12 && tile !== 14 && tile !== 15 && tile !== 16 && tile !== 99) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function hasLineOfSightPoints(x1, y1, x2, y2, chunks, worldChanges) {
+    const dist = Math.hypot(x2 - x1, y2 - y1);
+    const steps = Math.ceil(dist / (TILE_SIZE / 2));
+    for (let i = 0; i <= steps; i++) {
+        const currentX = x1 + (x2 - x1) * (i / steps);
+        const currentY = y1 + (y2 - y1) * (i / steps);
+        const gridX = Math.floor(currentX / TILE_SIZE);
+        const gridY = Math.floor(currentY / TILE_SIZE);
+        
+        if (gridX === Math.floor(x2 / TILE_SIZE) && gridY === Math.floor(y2 / TILE_SIZE)) continue;
+        if (gridX === Math.floor(x1 / TILE_SIZE) && gridY === Math.floor(y1 / TILE_SIZE)) continue;
+        
+        const tile = getTile(gridX, gridY, chunks, worldChanges);
+        if (tile !== 0 && tile !== 3 && tile !== 4 && tile !== 12 && tile !== 14 && tile !== 15 && tile !== 16 && tile !== 99) {
             return false;
         }
     }
@@ -182,11 +220,7 @@ rl.on('line', (input) => {
             }
             break;
         case 'stop':
-            io.emit('chatMessage', { id: 'SERVER', nick: '[SERWER]', text: 'Zamykanie serwera...' });
-            saveAllPlayers(players, () => {
-                log('SYSTEM', 'STOP');
-                process.exit(0);
-            });
+            shutdownServer();
             break;
     }
 });
@@ -225,6 +259,39 @@ setInterval(() => {
 
     if (gameTime % 600 === 0) {
         saveAllPlayers(players);
+        saveWorldChanges(dimensions);
+    }
+
+    if (gameTime % 15 === 0) {
+        let liquidUpdates = [];
+        for (let pid in players) {
+            let p = players[pid];
+            if (p.isDead) continue;
+            let dim = p.dimension;
+            let px = Math.floor(p.x / TILE_SIZE);
+            let py = Math.floor(p.y / TILE_SIZE);
+            for (let x = px - 25; x <= px + 25; x++) {
+                for (let y = py + 20; y >= py - 20; y--) {
+                    if (getTile(x, y, dimensions[dim].chunks, dimensions[dim].worldChanges) === 12) {
+                        let bottom = getTile(x, y + 1, dimensions[dim].chunks, dimensions[dim].worldChanges);
+                        if (bottom === 0) {
+                            liquidUpdates.push({x: x, y: y + 1, dim: dim});
+                        } else if (bottom !== 12 && bottom !== 14 && bottom !== 15 && bottom !== 16 && bottom !== 99) {
+                            let left = getTile(x - 1, y, dimensions[dim].chunks, dimensions[dim].worldChanges);
+                            let right = getTile(x + 1, y, dimensions[dim].chunks, dimensions[dim].worldChanges);
+                            if (left === 0) liquidUpdates.push({x: x - 1, y: y, dim: dim});
+                            if (right === 0) liquidUpdates.push({x: x + 1, y: y, dim: dim});
+                        }
+                    }
+                }
+            }
+        }
+        liquidUpdates.forEach(w => {
+            if (getTile(w.x, w.y, dimensions[w.dim].chunks, dimensions[w.dim].worldChanges) === 0) {
+                dimensions[w.dim].worldChanges[`${w.x},${w.y}`] = 12;
+                io.emit('blockUpdate', { x: w.x, y: w.y, type: 12, dimension: w.dim });
+            }
+        });
     }
 
     const earthPlayerIds = Object.keys(players).filter(id => players[id].dimension === 'earth');
@@ -389,7 +456,7 @@ setInterval(() => {
             const tileLower = getTile(Math.floor(frontX / TILE_SIZE), Math.floor((m.y + m.height - 5) / TILE_SIZE), dimensions[m.dimension].chunks, dimensions[m.dimension].worldChanges);
             const tileUpper = getTile(Math.floor(frontX / TILE_SIZE), Math.floor((m.y + m.height - TILE_SIZE - 5) / TILE_SIZE), dimensions[m.dimension].chunks, dimensions[m.dimension].worldChanges);
             
-            function isBlockSolid(t) { return !(t === 0 || t === 3 || t === 4 || t === 12 || t === 14 || t === 15 || t === 99); }
+            function isBlockSolid(t) { return !(t === 0 || t === 3 || t === 4 || t === 12 || t === 14 || t === 15 || t === 16 || t === 99); }
             if (m.velX !== 0 && m.grounded && (isBlockSolid(tileLower) || isBlockSolid(tileUpper))) {
                 m.velY = config.jumpForce;
             }
@@ -510,7 +577,7 @@ function handleCommand(socket, msg) {
             const newNick = args.join(' ').substring(0, 15);
             if (newNick && players[socket.id]) {
                 const oldNick = players[socket.id].nick;
-                if (oldNick !== "Gracz") savePlayer(oldNick, players[socket.id].x, players[socket.id].y, players[socket.id].dimension);
+                if (oldNick !== "Gracz") savePlayer(oldNick, players[socket.id].x, players[socket.id].y, players[socket.id].dimension, players[socket.id].inventory);
                 players[socket.id].nick = newNick;
                 io.emit('playerNickUpdate', { id: socket.id, nick: newNick });
                 socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `Zmieniono nick na ${newNick}` });
@@ -583,13 +650,14 @@ io.on('connection', (socket) => {
         x: spawnGridX * TILE_SIZE, y: (gridY - 1) * TILE_SIZE, width: 20, height: 40, velX: 0, velY: 0, grounded: false, inWater: false,
         nick: "Gracz", color: '#' + Math.floor(Math.random()*16777215).toString(16),
         inputs: { left: false, right: false, jump: false },
-        prevJump: false, regenCooldown: 0, characterClass: 'soldier'
+        prevJump: false, regenCooldown: 0, characterClass: 'soldier', inventory: { 999: 1 }
     };
 
     socket.emit('initWorld', { 
         chunks: dimensions['earth'].chunks, 
         worldChanges: dimensions['earth'].worldChanges, 
-        dayDuration: DAY_DURATION 
+        dayDuration: DAY_DURATION,
+        recipes: RECIPES
     });
 
     socket.on('setNick', (data) => {
@@ -608,18 +676,23 @@ io.on('connection', (socket) => {
                     players[socket.id].x = row.x;
                     players[socket.id].y = row.y;
                     players[socket.id].dimension = row.dimension || 'earth';
+                    players[socket.id].inventory = JSON.parse(row.inventory || '{"999":1}');
                     
                     socket.emit('dimensionChange', { dimension: players[socket.id].dimension });
                     socket.emit('initDimension', { 
                         dimension: players[socket.id].dimension, 
                         chunks: dimensions[players[socket.id].dimension].chunks, 
-                        worldChanges: dimensions[players[socket.id].dimension].worldChanges 
+                        worldChanges: dimensions[players[socket.id].dimension].worldChanges,
+                        recipes: RECIPES
                     });
 
+                    socket.emit('inventoryUpdate', players[socket.id].inventory);
                     socket.emit('chatMessage', { id: 'SYSTEM', nick: 'STORY', text: storyText });
                     socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `Witaj ponownie, ${cleanNick}!` });
                     socket.broadcast.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${cleanNick} powrócił do gry!` });
                 } else {
+                    players[socket.id].inventory = { 999: 1 };
+                    socket.emit('inventoryUpdate', players[socket.id].inventory);
                     socket.emit('chatMessage', { id: 'SYSTEM', nick: 'STORY', text: storyText });
                     io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${cleanNick} dołączył do serwera!` });
                 }
@@ -654,6 +727,22 @@ io.on('connection', (socket) => {
                 } else {
                     socket.emit('chatMessage', { id: 'SYSTEM', nick: 'PORTAL', text: 'Brak zasilania. Tunel czasoprzestrzenny jest obecnie poza zasięgiem.' });
                 }
+            } else if (tile === 16) {
+                if (dim === 'earth') {
+                    const progress = gameTime / DAY_DURATION;
+                    const isNight = progress > 0.8 || progress < 0.2;
+                    if (isNight) {
+                        if (progress > 0.8) {
+                            daysPassed++;
+                        }
+                        gameTime = Math.floor(DAY_DURATION * 0.2);
+                        io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: 'Noc została pominięta.' });
+                    } else {
+                        socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: 'Możesz spać tylko w nocy.' });
+                    }
+                } else {
+                    socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: 'Tu nie da się spać.' });
+                }
             }
         }
     });
@@ -680,13 +769,12 @@ io.on('connection', (socket) => {
             p.hp = p.maxHp; p.air = p.maxAir;
             p.isDead = false; p.isFlying = false; p.flightTimer = 0;
             p.regenCooldown = 0; p.inputs = { left: false, right: false, jump: false };
-            p.prevJump = false; 
+            p.prevJump = false; p.dimension = 'earth'; 
             
-            const currentDim = p.dimension;
-            socket.emit('dimensionChange', { dimension: currentDim });
+            socket.emit('dimensionChange', { dimension: 'earth' });
             
             const spawnGridX = Math.floor((Math.random() - 0.5) * 40);
-            const gridY = getSurfaceGridY(spawnGridX, currentDim);
+            const gridY = getSurfaceGridY(spawnGridX, 'earth');
             p.x = spawnGridX * TILE_SIZE; 
             p.y = (gridY - 1) * TILE_SIZE;
             p.velY = 0; p.velX = 0; p.highestY = undefined;
@@ -738,22 +826,67 @@ io.on('connection', (socket) => {
         const dim = p.dimension;
         const currentTile = getTile(x, y, dimensions[dim].chunks, dimensions[dim].worldChanges);
         if (currentTile === 99) return;
+        
+        const pCenterX = p.x + p.width / 2;
+        const pCenterY = p.y + p.height / 2;
+        const targetCenterX = x * TILE_SIZE + TILE_SIZE / 2;
+        const targetCenterY = y * TILE_SIZE + TILE_SIZE / 2;
+
+        if (!hasLineOfSightPoints(pCenterX, pCenterY, targetCenterX, targetCenterY, dimensions[dim].chunks, dimensions[dim].worldChanges)) {
+            return;
+        }
+
         if (type !== 0) {
+            if (!p.inventory[type] || p.inventory[type] <= 0) return;
             const isReplaceable = (currentTile === 0 || currentTile === 4 || currentTile === 12);
             if (!isReplaceable) return;
-            function isSupport(t) { return t !== 0 && t !== 12 && t !== 4 && t !== 99 && t !== 14 && t !== 15; }
-            if (!isSupport(getTile(x, y - 1, dimensions[dim].chunks, dimensions[dim].worldChanges)) && !isSupport(getTile(x, y + 1, dimensions[dim].chunks, dimensions[dim].worldChanges)) && !isSupport(getTile(x - 1, y, dimensions[dim].chunks, dimensions[dim].worldChanges)) && !isSupport(getTile(x + 1, y, dimensions[dim].chunks, dimensions[dim].worldChanges))) return;
-        } else { if (currentTile === 0 || currentTile === 12) return; }
+            function isSupport(t) { return t !== 0 && t !== 12 && t !== 4 && t !== 99 && t !== 14 && t !== 15 && t !== 16; }
+            const tTop = getTile(x, y - 1, dimensions[dim].chunks, dimensions[dim].worldChanges);
+            const tBot = getTile(x, y + 1, dimensions[dim].chunks, dimensions[dim].worldChanges);
+            const tLeft = getTile(x - 1, y, dimensions[dim].chunks, dimensions[dim].worldChanges);
+            const tRight = getTile(x + 1, y, dimensions[dim].chunks, dimensions[dim].worldChanges);
+            if (!isSupport(tTop) && !isSupport(tBot) && !isSupport(tLeft) && !isSupport(tRight)) return;
+            
+            p.inventory[type]--;
+        } else { 
+            if (currentTile === 0 || currentTile === 12 || currentTile === 14 || currentTile === 15) return;
+            p.inventory[currentTile] = (p.inventory[currentTile] || 0) + 1;
+        }
 
+        socket.emit('inventoryUpdate', p.inventory);
         dimensions[dim].worldChanges[`${x},${y}`] = type;
         io.emit('blockUpdate', { x, y, type, dimension: dim });
+    });
+
+    socket.on('craft', (recipeId) => {
+        const p = players[socket.id];
+        if (!p || p.isDead || p.isFlying) return;
+        
+        const recipe = RECIPES.find(r => r.id === recipeId);
+        if (!recipe) return;
+        
+        let canCraft = true;
+        for (let r of recipe.req) {
+            if ((p.inventory[r.id] || 0) < r.count) {
+                canCraft = false; break;
+            }
+        }
+        
+        if (canCraft) {
+            for (let r of recipe.req) {
+                p.inventory[r.id] -= r.count;
+            }
+            p.inventory[recipe.id] = (p.inventory[recipe.id] || 0) + recipe.count;
+            socket.emit('inventoryUpdate', p.inventory);
+            socket.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: 'Skonstruowano przedmiot.' });
+        }
     });
 
     socket.on('disconnect', () => {
         if(players[socket.id]) {
             const p = players[socket.id];
             if (p.nick && p.nick !== "Gracz" && !p.isDead) {
-                savePlayer(p.nick, p.x, p.y, p.dimension);
+                savePlayer(p.nick, p.x, p.y, p.dimension, p.inventory);
             }
             io.emit('chatMessage', { id: 'SYSTEM', nick: 'INFO', text: `${p.nick} opuścił serwer.` });
             delete players[socket.id];
